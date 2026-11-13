@@ -1,0 +1,441 @@
+# Source-Code
+Source code for Smart Face Recognition Based Automated Attendance System
+import os
+import pickle
+import cv2
+import numpy as np
+import pandas as pd
+
+DATASET_PATH = "dataset"
+CSV_PATH = "names_enroll_branch.csv"
+MODELS_DIR = "models"
+DETECTOR_PATH = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+RECOGNIZER_PATH = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onnx")
+ENCODINGS_PATH = os.path.join(MODELS_DIR, "encodings.pkl")
+
+df = pd.read_csv(CSV_PATH)
+name_to_enroll = dict(zip(df['name'].astype(str).str.lower(), df['enroll_no']))
+
+detector = cv2.FaceDetectorYN.create(
+    model=DETECTOR_PATH,
+    config="",
+    input_size=(320, 320),
+    score_threshold=0.6,
+    nms_threshold=0.3
+)
+
+recognizer = cv2.FaceRecognizerSF.create(
+    model=RECOGNIZER_PATH,
+    config=""
+)
+
+known_encodings = []
+known_names = []
+known_enrolls = []
+
+print("🚀 Training started using OpenCV SFace...")
+
+if os.path.exists(DATASET_PATH):
+    for person_name in os.listdir(DATASET_PATH):
+        folder = os.path.join(DATASET_PATH, person_name)
+        if not os.path.isdir(folder):
+            continue
+
+        person_clean = person_name.lower().replace(" ", "_")
+        if person_clean not in name_to_enroll:
+            print(f"⚠️ Skipping {person_name} (Not found in CSV)")
+            continue
+
+        enroll = name_to_enroll[person_clean]
+
+        for img_name in os.listdir(folder):
+            path = os.path.join(folder, img_name)
+            image = cv2.imread(path)
+            if image is None:
+                continue
+
+            h, w, _ = image.shape
+            detector.setInputSize((w, h))
+
+            _, faces = detector.detect(image)
+            if faces is None:
+                print(f"❌ No face detected in {img_name}")
+                continue
+
+            aligned_face = recognizer.alignCrop(image, faces[0])
+            feature = recognizer.feature(aligned_face)
+
+            known_encodings.append(feature)
+            known_names.append(person_clean)
+            known_enrolls.append(enroll)
+
+            print(f"✅ Processed {img_name}")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+data = {
+    "encodings": known_encodings,
+    "names": known_names,
+    "enrolls": known_enrolls
+}
+
+with open(ENCODINGS_PATH, "wb") as f:
+    pickle.dump(data, f)
+
+print(f"🎉 Training complete! Saved {len(known_encodings)} encodings.")
+
+import os
+import pickle
+import cv2
+import numpy as np
+
+MODELS_DIR = "models"
+DETECTOR_PATH = os.path.join(MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+RECOGNIZER_PATH = os.path.join(MODELS_DIR, "face_recognition_sface_2021dec.onnx")
+ENCODINGS_PATH = os.path.join(MODELS_DIR, "encodings.pkl")
+
+# Initialize OpenCV DNN models
+detector = cv2.FaceDetectorYN.create(
+    model=DETECTOR_PATH,
+    config="",
+    input_size=(320, 320),
+    score_threshold=0.6,
+    nms_threshold=0.3,
+    top_k=5000
+)
+
+recognizer = cv2.FaceRecognizerSF.create(
+    model=RECOGNIZER_PATH,
+    config=""
+)
+
+# Load encodings database
+data = {"encodings": [], "names": [], "enrolls": []}
+if os.path.exists(ENCODINGS_PATH):
+    with open(ENCODINGS_PATH, "rb") as f:
+        data = pickle.load(f)
+
+def recognize_faces(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        return []
+
+    h, w, _ = image.shape
+    detector.setInputSize((w, h))
+
+    # Detect faces
+    _, faces = detector.detect(image)
+    if faces is None:
+        return []
+
+    results = []
+
+    for face in faces:
+        bbox = face[0:4].astype(int)
+        x, y, bw, bh = bbox
+
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(w, x + bw), min(h, y + bh)
+        face_crop = image[y1:y2, x1:x2]
+
+        # Extract features using SFace
+        aligned_face = recognizer.alignCrop(image, face)
+        feature = recognizer.feature(aligned_face)
+
+        name = "Unknown"
+        enroll = "N/A"
+        confidence = 0.0
+
+        if len(data["encodings"]) > 0:
+            similarities = [
+                recognizer.match(feature, np.array(known_enc), cv2.FaceRecognizerSF_FR_COSINE)
+                for known_enc in data["encodings"]
+            ]
+
+            best_idx = int(np.argmax(similarities))
+            best_score = float(similarities[best_idx])
+
+            # Standard SFace Cosine similarity threshold (~0.363)
+            if best_score > 0.363:
+                name = data["names"][best_idx]
+                enroll = data["enrolls"][best_idx]
+                confidence = round(min(100.0, best_score * 100), 2)
+
+        face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB) if face_crop.size > 0 else None
+
+        results.append({
+            "name": name,
+            "enroll": enroll,
+            "confidence": confidence,
+            "face": face_rgb
+        })
+
+    # Deduplicate by enrollment number
+    unique_students = {}
+    for r in results:
+        unique_students[r["enroll"]] = r
+
+    return list(unique_students.values())
+
+    import streamlit as st
+import pandas as pd
+from recognize import recognize_faces
+import tempfile
+import os
+from datetime import datetime
+import sqlite3
+
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(page_title="AI Attendance System", layout="wide")
+
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.title("📘 AI Attendance System")
+st.sidebar.write("Smart Face Recognition")
+
+# =========================
+# LOGIN
+# =========================
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.title("🔐 Teacher Login")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if username == "admin" and password == "1234":
+            st.session_state.logged_in = True
+            st.success("Login successful!")
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+
+    st.stop()
+
+# =========================
+# DATABASE
+# =========================
+conn = sqlite3.connect("attendance.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS attendance (
+    name TEXT,
+    enroll TEXT,
+    subject TEXT,
+    date TEXT,
+    time TEXT,
+    present INTEGER
+)
+""")
+conn.commit()
+
+# =========================
+# SESSION
+# =========================
+if "form_submitted" not in st.session_state:
+    st.session_state.form_submitted = False
+
+# =========================
+# TEACHER FORM
+# =========================
+if not st.session_state.form_submitted:
+
+    st.title("🎓 AI Attendance System")
+    st.header("👨‍🏫 Enter Teacher Details")
+
+    with st.form("teacher_form"):
+        t_name = st.text_input("Teacher Name")
+        t_id = st.text_input("Teacher ID")
+        subject = st.text_input("Subject")
+        period = st.text_input("Period")
+
+        submit = st.form_submit_button("Proceed")
+
+        if submit:
+            st.session_state.form_submitted = True
+            st.session_state.teacher = {
+                "name": t_name,
+                "id": t_id,
+                "subject": subject,
+                "period": period
+            }
+            st.rerun()
+
+# =========================
+# MAIN APP
+# =========================
+if st.session_state.form_submitted:
+
+    teacher = st.session_state.teacher
+
+    st.success(
+        f"👨‍🏫 {teacher['name']} | 📘 {teacher['subject']} | ⏱ Period: {teacher['period']}"
+    )
+
+    if st.button("🔄 Reset"):
+        st.session_state.form_submitted = False
+        st.rerun()
+
+    st.header("📤 Upload Classroom Images")
+
+    uploaded_files = st.file_uploader(
+        "Upload images",
+        type=["jpg", "png", "jpeg"],
+        accept_multiple_files=True
+    )
+
+    st.subheader("📸 OR Use Camera")
+    camera_img = st.camera_input("Capture Image")
+
+    all_results = []
+
+    # PROCESS UPLOAD
+    if uploaded_files:
+        for file in uploaded_files:
+            temp_dir = tempfile.mkdtemp()
+            path = os.path.join(temp_dir, file.name)
+
+            with open(path, "wb") as f:
+                f.write(file.read())
+
+            st.image(path, caption=file.name, use_container_width=True)
+
+            results = recognize_faces(path)
+            if isinstance(results, list):
+                all_results.extend(results)
+
+    # PROCESS CAMERA
+    if camera_img:
+        temp_path = "temp_captured.jpg"
+        with open(temp_path, "wb") as f:
+            f.write(camera_img.getbuffer())
+
+        st.image(temp_path, caption="Captured Image", use_container_width=True)
+
+        results = recognize_faces(temp_path)
+        if isinstance(results, list):
+            all_results.extend(results)
+
+    # REMOVE DUPLICATES
+    unique_students = {}
+    for r in all_results:
+        unique_students[r["enroll"]] = r
+
+    final_results = list(unique_students.values())
+
+    if len(final_results) == 0:
+        st.warning("No students detected ❌")
+
+    else:
+        st.success(f"✅ {len(final_results)} students detected")
+
+        st.subheader("📋 Mark Attendance")
+
+        attendance_data = []
+
+        for i, r in enumerate(final_results):
+
+            col1, col2, col3, col4 = st.columns([2, 3, 2, 2])
+
+            with col1:
+                if r.get("face") is not None:
+                    st.image(r["face"], width=100)
+
+            with col2:
+                st.write(f"👤 **{r.get('name', 'Unknown')}**")
+
+                conf = r.get("confidence", 0)
+
+                if conf > 70:
+                    st.success(f"Confidence: {conf:.2f}%")
+                elif conf > 50:
+                    st.warning(f"Confidence: {conf:.2f}%")
+                else:
+                    st.error(f"Confidence: {conf:.2f}%")
+
+            with col3:
+                st.write(f"🎫 **{r.get('enroll', 'N/A')}**")
+
+            with col4:
+                present = st.checkbox("✔", key=i, value=True)
+
+            attendance_data.append({
+                "name": str(r.get("name", "")),
+                "enroll": str(r.get("enroll", "")),
+                "confidence": float(r.get("confidence", 0)),
+                "present": present
+            })
+
+        # ADD ABSENT STUDENTS
+        if os.path.exists("names_enroll_branch.csv"):
+            all_students = pd.read_csv("names_enroll_branch.csv")
+            detected_enrolls = [r["enroll"] for r in final_results]
+
+            for _, row in all_students.iterrows():
+                if str(row["enroll_no"]) not in detected_enrolls:
+                    attendance_data.append({
+                        "name": row["name"],
+                        "enroll": str(row["enroll_no"]),
+                        "confidence": 0,
+                        "present": False
+                    })
+
+        # SAVE
+        if st.button("💾 Save Attendance"):
+
+            df = pd.DataFrame(attendance_data)
+
+            now = datetime.now()
+            date = now.strftime("%Y-%m-%d")
+            time = now.strftime("%H:%M:%S")
+
+            df["date"] = date
+            df["time"] = time
+
+            file_name = f"attendance_{date}_{teacher['subject']}.csv"
+            df.to_csv(file_name, index=False)
+
+            for _, row in df.iterrows():
+                cursor.execute("""
+                INSERT INTO attendance VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    row["name"],
+                    row["enroll"],
+                    teacher["subject"],
+                    row["date"],
+                    row["time"],
+                    int(row["present"])
+                ))
+
+            conn.commit()
+
+            st.success("🎉 Attendance Saved Successfully!")
+
+            st.download_button(
+                "⬇ Download Attendance",
+                df.to_csv(index=False),
+                file_name
+            )
+
+            # DASHBOARD
+            total = len(df)
+            present = df["present"].sum()
+            absent = total - present
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total", total)
+            col2.metric("Present", present)
+            col3.metric("Absent", absent)
+
+            # ACCURACY
+            correct = len(df[df["confidence"] > 50])
+            accuracy = (correct / total) * 100 if total > 0 else 0
+            st.info(f"🎯 System Accuracy: {accuracy:.2f}%")
+
+            st.dataframe(df)
